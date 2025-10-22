@@ -11,6 +11,7 @@ echo.
 echo Building executable...
 pyinstaller --name=SSHTunnelManager --windowed --onefile --clean ssh_tunnel_manager.py
 
+
 echo.
 echo Done! Check the dist folder for SSHTunnelManager.exe
 pause

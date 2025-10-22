@@ -198,6 +198,7 @@ class SSHTunnelManager(QMainWindow):
         
         if sys.platform == 'win32':
             common_paths = [
+                r'C:\Windows\Sysnative\OpenSSH\ssh.exe',
                 r'C:\Windows\System32\OpenSSH\ssh.exe',
                 r'C:\Program Files\Git\usr\bin\ssh.exe',
                 r'C:\Program Files (x86)\Git\usr\bin\ssh.exe',
