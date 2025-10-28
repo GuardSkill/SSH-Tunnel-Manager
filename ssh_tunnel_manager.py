@@ -638,11 +638,17 @@ class SSHTunnelManager(QMainWindow):
         server = f"{config['server_user']}@{config['server_ip']}"
         port = config['server_port']
         password = config.get('password', '')
-        
+        ssh_options = [
+        '-o', 'StrictHostKeyChecking=no',
+        # '-o', 'UserKnownHostsFile=/dev/null',  # 可选:不保存到 known_hosts
+        # '-o', 'LogLevel=ERROR'  # 减少警告信息
+    ]
         # Windows下不使用-f参数，使用隐藏窗口方式
+        # ssh -p 4000 -CNg -L 8677:127.0.0.1:8675 root@115.190.75.243  -o StrictHostKeyChecking=no
         if sys.platform == 'win32':
             cmd = [
                 self.ssh_path, '-N',
+                 *ssh_options,  # 添加 SSH 选项
                 '-L', f'{local}:localhost:{remote}',
                 '-p', str(port),
                 server
@@ -650,6 +656,7 @@ class SSHTunnelManager(QMainWindow):
         else:
             cmd = [
                 self.ssh_path, '-N', '-f',
+                 *ssh_options,  # 添加 SSH 选项
                 '-L', f'{local}:localhost:{remote}',
                 '-p', str(port),
                 server

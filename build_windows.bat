@@ -9,7 +9,8 @@ if exist dist rmdir /s /q dist
 
 echo.
 echo Building executable...
-pyinstaller --name=SSHTunnelManager --windowed --onefile --clean ssh_tunnel_manager.py
+pyinstaller --name=SSHTunnelManager --windowed --onefile --clean ssh_tunnel_manage_v2.py
+@REM pyinstaller --name=SSHTunnelManager --windowed --onefile --clean ssh_tunnel_manage_v1.py
 
 
 echo.
