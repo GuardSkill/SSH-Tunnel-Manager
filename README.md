@@ -3,6 +3,7 @@
 一个免费、开源、方便的SSH隧道管理工具，支持图形化界面管理多个SSH端口转发隧道，一键启停，保存主机密钥和配置，缩小到系统托盘，不影响其他界面操作。特别适合一些使用docker、Podman、Containerd、Kubernetes等容器服务器，想把容器中的网页/程序/工具的端口映射到本地的用户们。
 
 [windows版本下载](https://github.com/GuardSkill/SSH-Tunnel-Manager/releases/download/v2.0/SSHTunnelManager.exe)
+[windows v1版本下载(只支持密钥登陆)](https://github.com/GuardSkill/SSH-Tunnel-Manager/releases/download/v1.0/SSHTunnelManager.exe)
 
 <a href="#-支持开发者--support-the-developer"> 
   <img src="https://img.shields.io/badge/感谢支持-支付宝-ff69b4.svg?style=for-the-badge&logo=alipay&logoColor=white" alt="感谢支持支付宝">
