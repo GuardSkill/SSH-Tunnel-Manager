@@ -1,6 +1,9 @@
 @echo off
-echo Installing PyInstaller if needed...
-pip install pyinstaller
+setlocal
+
+echo Ensuring build dependencies...
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 
 echo.
 echo Cleaning old files...
@@ -9,10 +12,17 @@ if exist dist rmdir /s /q dist
 
 echo.
 echo Building executable...
-pyinstaller --name=SSHTunnelManager --windowed --onefile --clean ssh_tunnel_manage_v2.py
-@REM pyinstaller --name=SSHTunnelManager --windowed --onefile --clean ssh_tunnel_manage_v1.py
+python -m PyInstaller --name=SSHTunnelManager --windowed --onefile --clean ^
+    --collect-all PyQt5 ^
+    --hidden-import PyQt5.sip ^
+    ssh_tunnel_manage_v2.py
+@REM python -m PyInstaller --name=SSHTunnelManager --windowed --onefile --clean ^
+@REM     --collect-all PyQt5 ^
+@REM     --hidden-import PyQt5.sip ^
+@REM     ssh_tunnel_manage_v1.py
 
 
 echo.
 echo Done! Check the dist folder for SSHTunnelManager.exe
 pause
+endlocal

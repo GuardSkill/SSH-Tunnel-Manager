@@ -17,6 +17,7 @@ from PyQt5.QtGui import QIcon, QColor
 import paramiko
 import socket
 import select
+import time
 
 # 状态更新信号类
 class StatusSignal(QObject):
@@ -57,6 +58,7 @@ TRANSLATIONS = {
         'running': 'Running',
         'stopped': 'Stopped',
         'starting': 'Starting...',
+        'reconnecting': 'Reconnecting...',
         'start': 'Start',
         'stop': 'Stop',
         'success': 'Success',
@@ -79,6 +81,8 @@ TRANSLATIONS = {
         'exit': '🚪 Exit',
         'running_in_tray': 'SSH Tunnel Manager is running in the system tray',
         'language': 'Language',
+        'auto_restart': 'Auto restart dropped tunnels',
+        'auto_restart_hint': 'Periodically check and restart tunnels that were closed by the remote host',
         'auth_method': 'Authentication Method:',
         'select_key_file': 'Select SSH Key File',
         'default_key_hint': 'Optional - leave empty to auto-detect keys in %USERPROFILE%\\.ssh\\',
@@ -140,12 +144,14 @@ TRANSLATIONS = {
         'auth_method': '认证方式:',
         'select_key_file': '选择SSH密钥文件',
         'default_key_hint': '可选 - 留空则自动检测 %USERPROFILE%\\.ssh\\ 目录下的密钥',
+        'reconnecting': '重新连接中...',
+        'auto_restart': '隧道断线自动重连',
+        'auto_restart_hint': '每隔几秒检测隧道状态，若断开则自动重启',
     }
 }
 
 
 class TunnelThread(threading.Thread):
-    """SSH隧道线程"""
     def __init__(self, host_config, tunnel_config):
         super().__init__(daemon=True)
         self.host_config = host_config
@@ -155,146 +161,223 @@ class TunnelThread(threading.Thread):
         self.ssh_client = None
         self.transport = None
         self.server_socket = None
-        
-    def run(self):
-        try:
-            self.running = True
-            # 创建SSH客户端
-            self.ssh_client = paramiko.SSHClient()
-            self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            
-            # 连接参数
-            connect_kwargs = {
-                'hostname': self.host_config['server_ip'],
-                'port': self.host_config['ssh_port'],
-                'username': self.host_config['username'],
-                'timeout': 10,
-            }
-            
-            # 认证方式
-            if self.host_config.get('use_key', False):
-                key_file = self.host_config.get('key_file', '').strip()
-                if key_file:
-                    # 使用指定的密钥文件
-                    connect_kwargs['key_filename'] = key_file
-                else:
-                    # 如果key_file为空，尝试使用默认密钥
-                    # paramiko 在 Windows 上不会自动查找 C:\Users\xxx\.ssh
-                    # 需要手动指定常见的密钥路径
-                    default_keys = []
-                    ssh_dir = Path.home() / '.ssh'
-                    
-                    # 常见的密钥文件名
-                    key_names = ['id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519']
-                    for key_name in key_names:
-                        key_path = ssh_dir / key_name
-                        if key_path.exists():
-                            default_keys.append(str(key_path))
-                    
-                    if default_keys:
-                        connect_kwargs['key_filename'] = default_keys
-                    # 如果没有找到密钥文件，paramiko会尝试ssh-agent
+        self.keepalive_interval = 30  # seconds
+        self.reconnect_delay = 3  # seconds
+        self._current_status = None
+        self._has_connected = False
+        self.last_error = ''
+
+    def _emit_status(self, status, error=''):
+        if self._current_status == status and not error:
+            return
+        self._current_status = status
+        self.signal.status_changed.emit(status, error)
+
+    def _create_server_socket(self):
+        local_port = self.tunnel_config['local_port']
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(('127.0.0.1', local_port))
+        self.server_socket.listen(5)
+        self.server_socket.settimeout(1)
+
+    def _close_server_socket(self):
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
+
+    def _close_transport(self):
+        if self.transport:
+            try:
+                self.transport.close()
+            except Exception:
+                pass
+            self.transport = None
+        if self.ssh_client:
+            try:
+                self.ssh_client.close()
+            except Exception:
+                pass
+            self.ssh_client = None
+
+    def _connect_ssh(self):
+        self._close_transport()
+        self.ssh_client = paramiko.SSHClient()
+        self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        connect_kwargs = {
+            'hostname': self.host_config['server_ip'],
+            'port': self.host_config['ssh_port'],
+            'username': self.host_config['username'],
+            'timeout': 10,
+            'banner_timeout': 10,
+            'auth_timeout': 10,
+        }
+
+        if self.host_config.get('use_key', False):
+            key_file = self.host_config.get('key_file', '').strip()
+            if key_file:
+                connect_kwargs['key_filename'] = key_file
             else:
-                password = self.host_config.get('password', '')
-                if password:
-                    connect_kwargs['password'] = password
-            
-            # 连接SSH
-            self.ssh_client.connect(**connect_kwargs)
-            self.transport = self.ssh_client.get_transport()
-            
-            # 本地监听
-            local_port = self.tunnel_config['local_port']
-            remote_host = self.tunnel_config.get('remote_host', '127.0.0.1')
-            remote_port = self.tunnel_config['remote_port']
-            
-            # 创建本地socket
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind(('127.0.0.1', local_port))
-            self.server_socket.listen(5)
-            self.server_socket.settimeout(1)
-            
-            self.signal.status_changed.emit('running', '')
-            
+                default_keys = []
+                ssh_dir = Path.home() / '.ssh'
+                key_names = ['id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519']
+                for key_name in key_names:
+                    key_path = ssh_dir / key_name
+                    if key_path.exists():
+                        default_keys.append(str(key_path))
+                if default_keys:
+                    connect_kwargs['key_filename'] = default_keys
+        else:
+            password = self.host_config.get('password', '')
+            if password:
+                connect_kwargs['password'] = password
+
+        self.ssh_client.connect(**connect_kwargs)
+        self.transport = self.ssh_client.get_transport()
+        if self.transport:
+            self.transport.set_keepalive(self.keepalive_interval)
+
+    def _ensure_transport(self):
+        if self.transport and self.transport.is_active():
+            return True
+
+        if not self.running:
+            return False
+
+        if self._has_connected:
+            self._emit_status('reconnecting', '')
+        else:
+            self._emit_status('starting', '')
+
+        try:
+            self._connect_ssh()
+            self._has_connected = True
+            self._emit_status('running', '')
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            print(f'SSH connect error: {exc}')
+            time.sleep(self.reconnect_delay)
+            return False
+
+    def _handle_channel_error(self, error):
+        if not self.running:
+            return
+        error_msg = str(error)
+        self.last_error = error_msg
+        print(f'Channel open error: {error_msg}')
+
+        reset_indicators = ('10054', '10053', '10060', '10061', 'connection reset', 'Connection reset')
+        if isinstance(error, paramiko.SSHException) or any(indicator in error_msg for indicator in reset_indicators):
+            self._close_transport()
+        time.sleep(1)
+
+    def run(self):
+        remote_host = self.tunnel_config.get('remote_host', '127.0.0.1')
+        remote_port = self.tunnel_config['remote_port']
+        self.running = True
+        self._emit_status('starting', '')
+
+        try:
+            try:
+                self._create_server_socket()
+            except Exception as exc:
+                self.last_error = str(exc)
+                print(f'Failed to create local listener: {exc}')
+                self._emit_status('error', str(exc))
+                return
+
             while self.running:
+                if not self._ensure_transport():
+                    continue
+
                 try:
-                    client_socket, addr = self.server_socket.accept()
-                    # 创建转发通道
+                    client_socket, _ = self.server_socket.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if not self.running:
+                        break
+                    time.sleep(1)
+                    continue
+                except Exception as exc:
+                    if self.running:
+                        print(f'Accept error: {exc}')
+                    time.sleep(1)
+                    continue
+
+                if not self.running:
+                    client_socket.close()
+                    break
+
+                if not self.transport or not self.transport.is_active():
+                    client_socket.close()
+                    self._close_transport()
+                    continue
+
+                try:
                     channel = self.transport.open_channel(
                         'direct-tcpip',
                         (remote_host, remote_port),
                         client_socket.getpeername()
                     )
-                    
-                    if channel is None:
-                        client_socket.close()
-                        continue
-                    
-                    # 启动转发线程
-                    threading.Thread(
-                        target=self._forward_tunnel,
-                        args=(client_socket, channel),
-                        daemon=True
-                    ).start()
-                    
-                except socket.timeout:
+                except Exception as exc:
+                    client_socket.close()
+                    self._handle_channel_error(exc)
                     continue
-                except Exception as e:
-                    if self.running:
-                        print(f"Accept error: {e}")
-                    break
-            
-            if self.server_socket:
-                self.server_socket.close()
-            
-        except Exception as e:
-            print(f"Tunnel error: {e}")
-            self.signal.status_changed.emit('error', str(e))
+
+                if channel is None:
+                    client_socket.close()
+                    continue
+
+                threading.Thread(
+                    target=self._forward_tunnel,
+                    args=(client_socket, channel),
+                    daemon=True
+                ).start()
         finally:
             self.running = False
-            if self.ssh_client:
-                try:
-                    self.ssh_client.close()
-                except:
-                    pass
-            if self.server_socket:
-                try:
-                    self.server_socket.close()
-                except:
-                    pass
-            self.signal.status_changed.emit('stopped', '')
-    
+            self._close_transport()
+            self._close_server_socket()
+            self._emit_status('stopped', '')
+
     def _forward_tunnel(self, client_socket, channel):
-        """转发数据"""
         try:
             while True:
-                r, w, x = select.select([client_socket, channel], [], [], 1)
-                if client_socket in r:
+                readable, _, _ = select.select([client_socket, channel], [], [], 1)
+                if client_socket in readable:
                     data = client_socket.recv(4096)
                     if not data:
                         break
                     channel.send(data)
-                if channel in r:
+                if channel in readable:
                     data = channel.recv(4096)
                     if not data:
                         break
                     client_socket.send(data)
-        except Exception as e:
+        except Exception:
             pass
         finally:
-            client_socket.close()
-            channel.close()
-    
-    def stop(self):
-        """停止隧道"""
-        self.running = False
-        if self.ssh_client:
             try:
-                self.ssh_client.close()
-            except:
+                client_socket.close()
+            except Exception:
+                pass
+            try:
+                channel.close()
+            except Exception:
                 pass
 
+    def is_connected(self):
+        return self.transport is not None and self.transport.is_active()
+
+    def stop(self):
+        self.running = False
+        self._close_transport()
+        self._close_server_socket()
 
 class HostDialog(QDialog):
     """主机配置对话框"""
@@ -473,6 +556,9 @@ class SSHTunnelManager(QMainWindow):
         self.current_host = None
         self.tunnels = {}  # {tunnel_id: {'config': {}, 'thread': TunnelThread, 'status': 'running/stopped'}}
         self.lang = 'zh'  # 默认中文
+        self.auto_restart_enabled = True
+        self.monitor_interval_ms = 3000
+        self.monitor_timer = None
         
         self.load_config()
         self.init_ui()
@@ -595,18 +681,23 @@ class SSHTunnelManager(QMainWindow):
         global_btn_layout = QHBoxLayout()
         self.start_all_btn = QPushButton(self.tr('start_all'))
         self.stop_all_btn = QPushButton(self.tr('stop_all'))
+        self.auto_restart_checkbox = QCheckBox(self.tr('auto_restart'))
+        self.auto_restart_checkbox.setToolTip(self.tr('auto_restart_hint'))
+        self.auto_restart_checkbox.setChecked(self.auto_restart_enabled)
+        self.auto_restart_checkbox.stateChanged.connect(self.on_auto_restart_changed)
         self.minimize_btn = QPushButton(self.tr('minimize'))
-        
+
         self.start_all_btn.clicked.connect(self.start_all_tunnels)
         self.stop_all_btn.clicked.connect(self.stop_all_tunnels)
         self.minimize_btn.clicked.connect(self.hide)
-        
+
         global_btn_layout.addWidget(self.start_all_btn)
         global_btn_layout.addWidget(self.stop_all_btn)
+        global_btn_layout.addWidget(self.auto_restart_checkbox)
         global_btn_layout.addStretch()
         global_btn_layout.addWidget(self.minimize_btn)
         active_layout.addLayout(global_btn_layout)
-        
+
         # 活动隧道表格
         self.tunnel_table = QTableWidget()
         self.tunnel_table.setColumnCount(6)
@@ -774,15 +865,28 @@ class SSHTunnelManager(QMainWindow):
                 # 状态
                 status = self.tr('stopped')
                 color = QColor(200, 200, 200)
-                
+
                 if tunnel_id in self.tunnels:
-                    if self.tunnels[tunnel_id]['status'] == 'running':
+                    info = self.tunnels[tunnel_id]
+                    current_status = info.get('status', 'stopped')
+                    if current_status == 'running':
                         status = self.tr('running')
                         color = QColor(144, 238, 144)
-                    elif self.tunnels[tunnel_id]['status'] == 'starting':
+                    elif current_status == 'starting':
                         status = self.tr('starting')
                         color = QColor(255, 255, 200)
-                
+                    elif current_status == 'reconnecting':
+                        status = self.tr('reconnecting')
+                        color = QColor(255, 215, 0)
+                    elif current_status == 'error':
+                        status = self.tr('error')
+                        color = QColor(255, 160, 160)
+                    elif current_status == 'stopped':
+                        status = self.tr('stopped')
+                        color = QColor(200, 200, 200)
+                    else:
+                        status = current_status
+
                 status_item = QTableWidgetItem(status)
                 status_item.setBackground(color)
                 self.tunnel_table.setItem(row, 4, status_item)
@@ -792,7 +896,7 @@ class SSHTunnelManager(QMainWindow):
                 btn_layout = QHBoxLayout(btn_widget)
                 btn_layout.setContentsMargins(2, 2, 2, 2)
                 
-                if tunnel_id in self.tunnels and self.tunnels[tunnel_id]['status'] == 'running':
+                if tunnel_id in self.tunnels and self.tunnels[tunnel_id]['status'] in ('running', 'starting', 'reconnecting'):
                     stop_btn = QPushButton(self.tr('stop'))
                     stop_btn.clicked.connect(lambda checked, h=host, t=tunnel: self.stop_single_tunnel(h, t))
                     btn_layout.addWidget(stop_btn)
@@ -1051,8 +1155,7 @@ class SSHTunnelManager(QMainWindow):
     def start_single_tunnel(self, host, tunnel):
         """从表格启动单个隧道"""
         tunnel_id = self.get_tunnel_id(host, tunnel)
-        
-        # 检查端口是否已被占用
+
         if self.is_port_in_use(tunnel['local_port']):
             QMessageBox.warning(
                 self,
@@ -1060,47 +1163,67 @@ class SSHTunnelManager(QMainWindow):
                 self.tr('port_in_use').format(tunnel['local_port'])
             )
             return
-        
-        # 创建线程
-        thread = TunnelThread(host, tunnel)
-        
-        # 使用偏函数来绑定tunnel_id，避免闭包问题
+
+        host_copy = copy.deepcopy(host)
+        tunnel_copy = copy.deepcopy(tunnel)
+
+        thread = TunnelThread(host_copy, tunnel_copy)
+
         handler = partial(self.on_tunnel_status_changed, tunnel_id)
         thread.signal.status_changed.connect(handler)
-        
+
         self.tunnels[tunnel_id] = {
-            'config': tunnel,
+            'config': tunnel_copy,
+            'host_config': host_copy,
+            'host_key': {
+                'name': host.get('name'),
+                'server_ip': host.get('server_ip')
+            },
             'thread': thread,
-            'status': 'starting'
+            'status': 'starting',
+            'last_error': '',
+            'allow_auto_restart': True
         }
-        
+
         thread.start()
         self.refresh_tunnel_table()
-    
+
     def stop_single_tunnel(self, host, tunnel):
         """从表格停止单个隧道"""
         tunnel_id = self.get_tunnel_id(host, tunnel)
-        
+
         if tunnel_id in self.tunnels:
-            self.tunnels[tunnel_id]['thread'].stop()
-            self.tunnels[tunnel_id]['status'] = 'stopped'
+            info = self.tunnels[tunnel_id]
+            info['thread'].stop()
+            if info['thread'].is_alive():
+                info['thread'].join(timeout=2)
+            info['status'] = 'stopped'
+            info['allow_auto_restart'] = False
             self.refresh_tunnel_table()
-    
+
     @pyqtSlot(str, str)
     def on_tunnel_status_changed(self, tunnel_id, status, error):
         """处理隧道状态变化（在主线程中）"""
         if tunnel_id in self.tunnels:
-            self.tunnels[tunnel_id]['status'] = status
-            
+            info = self.tunnels[tunnel_id]
+            info['status'] = status
+            if status == 'error':
+                info['last_error'] = error
+                info['allow_auto_restart'] = False
+            else:
+                info['last_error'] = error or ''
+                if status in ('running', 'starting', 'reconnecting'):
+                    info['allow_auto_restart'] = True
+
         if status == 'error' and error:
             QMessageBox.critical(
                 self,
                 self.tr('error'),
                 f"{self.tr('connection_failed')}: {error}"
             )
-        
+
         self.refresh_tunnel_table()
-    
+
     def start_all_tunnels(self):
         """启动所有隧道"""
         for host in self.hosts:
@@ -1111,12 +1234,17 @@ class SSHTunnelManager(QMainWindow):
     
     def stop_all_tunnels(self):
         """停止所有隧道"""
-        for tunnel_id in list(self.tunnels.keys()):
-            self.tunnels[tunnel_id]['thread'].stop()
+        for tunnel_id, info in list(self.tunnels.items()):
+            info['allow_auto_restart'] = False
+            thread = info.get('thread')
+            if thread:
+                thread.stop()
+                if thread.is_alive():
+                    thread.join(timeout=2)
             del self.tunnels[tunnel_id]
-        
+
         self.refresh_tunnel_table()
-    
+
     def is_port_in_use(self, port):
         """检查端口是否被占用"""
         try:
@@ -1128,21 +1256,79 @@ class SSHTunnelManager(QMainWindow):
         except:
             return False
     
+    def on_auto_restart_changed(self, state):
+        self.auto_restart_enabled = (state == Qt.Checked)
+        self.save_config()
+
     def start_monitor(self):
         """启动监控定时器"""
         self.monitor_timer = QTimer()
         self.monitor_timer.timeout.connect(self.check_tunnels)
-        self.monitor_timer.start(5000)
-    
+        interval = max(1000, int(self.monitor_interval_ms))
+        self.monitor_timer.start(interval)
+
     def check_tunnels(self):
         """检查隧道状态"""
-        for tunnel_id in list(self.tunnels.keys()):
-            thread = self.tunnels[tunnel_id]['thread']
+        to_restart = []
+        for tunnel_id, info in list(self.tunnels.items()):
+            thread = info.get('thread')
+            if thread is None:
+                continue
             if not thread.is_alive():
-                self.tunnels[tunnel_id]['status'] = 'stopped'
-        
+                info['status'] = 'stopped'
+                if self.auto_restart_enabled and info.get('allow_auto_restart', True):
+                    to_restart.append((tunnel_id, info))
+
         self.refresh_tunnel_table()
-    
+
+        for tunnel_id, info in to_restart:
+            self._restart_tunnel(tunnel_id, info)
+
+    def _resolve_host_for_tunnel(self, info):
+        host_key = info.get('host_key', {})
+        for host in self.hosts:
+            if host.get('name') == host_key.get('name') and host.get('server_ip') == host_key.get('server_ip'):
+                return host
+        return info.get('host_config')
+
+    def _resolve_tunnel_config(self, host, info):
+        config = info.get('config')
+        if config is None:
+            return None
+        if not host:
+            return config
+        target = (
+            config.get('local_port'),
+            config.get('remote_host', '127.0.0.1'),
+            config.get('remote_port')
+        )
+        for tunnel in host.get('tunnels', []):
+            candidate = (
+                tunnel.get('local_port'),
+                tunnel.get('remote_host', '127.0.0.1'),
+                tunnel.get('remote_port')
+            )
+            if candidate == target:
+                return tunnel
+        return config
+
+    def _restart_tunnel(self, tunnel_id, info):
+        host = self._resolve_host_for_tunnel(info)
+        if host is None:
+            host = info.get('host_config')
+        tunnel_config = self._resolve_tunnel_config(host, info)
+        if not host or not tunnel_config:
+            return
+
+        thread = info.get('thread')
+        if thread:
+            thread.stop()
+            if thread.is_alive():
+                thread.join(timeout=2)
+
+        self.tunnels.pop(tunnel_id, None)
+        self.start_single_tunnel(host, tunnel_config)
+
     def load_config(self):
         """加载配置"""
         if self.config_file.exists():
@@ -1151,18 +1337,26 @@ class SSHTunnelManager(QMainWindow):
                     data = json.load(f)
                     self.hosts = data.get('hosts', [])
                     self.lang = data.get('lang', 'zh')
-            except:
+                    self.auto_restart_enabled = data.get('auto_restart', True)
+                    interval = data.get('monitor_interval_ms', 3000)
+                    if isinstance(interval, int) and interval > 0:
+                        self.monitor_interval_ms = interval
+            except Exception:
                 self.hosts = []
-    
+                self.auto_restart_enabled = True
+                self.monitor_interval_ms = 3000
+
     def save_config(self):
         """保存配置"""
         data = {
             'hosts': self.hosts,
-            'lang': self.lang
+            'lang': self.lang,
+            'auto_restart': self.auto_restart_enabled,
+            'monitor_interval_ms': int(self.monitor_interval_ms)
         }
         with open(self.config_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-    
+
     def quit_app(self):
         """退出应用"""
         self.stop_all_tunnels()
