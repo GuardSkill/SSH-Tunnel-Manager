@@ -2,7 +2,6 @@ import sys
 import json
 import threading
 import copy
-import math
 from pathlib import Path
 from functools import partial
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -13,8 +12,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHeaderView, QAbstractItemView, QComboBox, 
                              QSplitter, QGroupBox, QRadioButton, QButtonGroup,
                              QFileDialog)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, pyqtSlot,QPoint
-from PyQt5.QtGui import QIcon, QColor, QPixmap, QPainter, QLinearGradient, QFont,QRadialGradient,QPen, QBrush,QPainterPath,QPolygon
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, pyqtSlot
+from PyQt5.QtGui import QIcon, QColor, QPixmap, QPainter, QLinearGradient, QFont, QPen, QPainterPath
 import paramiko
 import socket
 import select
@@ -565,6 +564,9 @@ class SSHTunnelManager(QMainWindow):
         self.monitor_timer = None
         self.tray_start_action = None
         self.tray_stop_action = None
+        self._start_queue = []
+        self._start_queue_processing = False
+        self._refresh_pending = False
         
         self.load_config()
         self.init_ui()
@@ -578,6 +580,7 @@ class SSHTunnelManager(QMainWindow):
     def init_ui(self):
         """初始化界面"""
         self.setWindowTitle(self.tr('window_title'))
+        self.setWindowIcon(self.generate_tray_icon())
         self.setGeometry(100, 100, 1200, 700)
         
         # 中央部件
@@ -1042,6 +1045,16 @@ class SSHTunnelManager(QMainWindow):
         layout.addWidget(button, alignment=Qt.AlignCenter)
         return container
 
+
+    def schedule_tunnel_table_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        QTimer.singleShot(0, self._perform_tunnel_table_refresh)
+
+    def _perform_tunnel_table_refresh(self):
+        self._refresh_pending = False
+        self.refresh_tunnel_table()
     def get_tunnel_id(self, host, tunnel):
         """生成隧道唯一ID"""
         return f"{host['name']}:{tunnel['local_port']}:{tunnel.get('remote_host', '127.0.0.1')}:{tunnel['remote_port']}"
@@ -1283,8 +1296,8 @@ class SSHTunnelManager(QMainWindow):
             self.refresh_config_list()
             self.refresh_tunnel_table()
     
-    def start_single_tunnel(self, host, tunnel):
-        """从表格启动单个隧道"""
+    def start_single_tunnel(self, host, tunnel, refresh=True):
+        """开始单个隧道线程"""
         tunnel_id = self.get_tunnel_id(host, tunnel)
 
         if self.is_port_in_use(tunnel['local_port']):
@@ -1317,7 +1330,8 @@ class SSHTunnelManager(QMainWindow):
         }
 
         thread.start()
-        self.refresh_tunnel_table()
+        if refresh:
+            self.schedule_tunnel_table_refresh()
 
     def stop_single_tunnel(self, host, tunnel):
         """从表格停止单个隧道"""
@@ -1330,7 +1344,7 @@ class SSHTunnelManager(QMainWindow):
                 info['thread'].join(timeout=2)
             info['status'] = 'stopped'
             info['allow_auto_restart'] = False
-            self.refresh_tunnel_table()
+            self.schedule_tunnel_table_refresh()
 
     def open_local_page(self, port):
         """在默认浏览器中打开本地隧道地址"""
@@ -1363,16 +1377,40 @@ class SSHTunnelManager(QMainWindow):
                 f"{self.tr('connection_failed')}: {error}"
             )
 
-        self.refresh_tunnel_table()
+        self.schedule_tunnel_table_refresh()
 
     def start_all_tunnels(self):
         """启动所有隧道"""
+        items = []
         for host in self.hosts:
             for tunnel in host.get('tunnels', []):
                 tunnel_id = self.get_tunnel_id(host, tunnel)
-                if tunnel_id not in self.tunnels or self.tunnels[tunnel_id]['status'] != 'running':
-                    self.start_single_tunnel(host, tunnel)
-    
+                status = self.tunnels.get(tunnel_id, {}).get('status')
+                if status not in ('running', 'starting', 'reconnecting'):
+                    items.append((host, tunnel))
+
+        if not items:
+            return
+
+        self._start_queue.extend(items)
+        if not self._start_queue_processing:
+            self._process_start_queue()
+
+    def _process_start_queue(self):
+        if not self._start_queue:
+            self._start_queue_processing = False
+            self.schedule_tunnel_table_refresh()
+            self.update_tray_actions()
+            return
+
+
+        self._start_queue_processing = True
+        host, tunnel = self._start_queue.pop(0)
+        self.start_single_tunnel(host, tunnel, refresh=False)
+        self.schedule_tunnel_table_refresh()
+        QTimer.singleShot(0, self._process_start_queue)
+
+
     def stop_all_tunnels(self):
         """停止所有隧道"""
         for tunnel_id, info in list(self.tunnels.items()):
@@ -1384,7 +1422,7 @@ class SSHTunnelManager(QMainWindow):
                     thread.join(timeout=2)
             del self.tunnels[tunnel_id]
 
-        self.refresh_tunnel_table()
+        self.schedule_tunnel_table_refresh()
 
     def is_port_in_use(self, port):
         """检查端口是否被占用"""
