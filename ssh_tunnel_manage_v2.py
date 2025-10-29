@@ -2,6 +2,7 @@ import sys
 import json
 import threading
 import copy
+import math
 from pathlib import Path
 from functools import partial
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -12,12 +13,13 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHeaderView, QAbstractItemView, QComboBox, 
                              QSplitter, QGroupBox, QRadioButton, QButtonGroup,
                              QFileDialog)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, pyqtSlot
-from PyQt5.QtGui import QIcon, QColor
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, pyqtSlot,QPoint
+from PyQt5.QtGui import QIcon, QColor, QPixmap, QPainter, QLinearGradient, QFont,QRadialGradient,QPen, QBrush,QPainterPath,QPolygon
 import paramiko
 import socket
 import select
 import time
+import webbrowser
 
 # 状态更新信号类
 class StatusSignal(QObject):
@@ -61,6 +63,7 @@ TRANSLATIONS = {
         'reconnecting': 'Reconnecting...',
         'start': 'Start',
         'stop': 'Stop',
+        'open_local': 'Open Local Page',
         'success': 'Success',
         'error': 'Error',
         'warning': 'Warning',
@@ -121,6 +124,7 @@ TRANSLATIONS = {
         'starting': '启动中...',
         'start': '启动',
         'stop': '停止',
+        'open_local': '打开本地网页',
         'success': '成功',
         'error': '错误',
         'warning': '警告',
@@ -559,6 +563,8 @@ class SSHTunnelManager(QMainWindow):
         self.auto_restart_enabled = True
         self.monitor_interval_ms = 3000
         self.monitor_timer = None
+        self.tray_start_action = None
+        self.tray_stop_action = None
         
         self.load_config()
         self.init_ui()
@@ -723,23 +729,102 @@ class SSHTunnelManager(QMainWindow):
     def init_tray(self):
         """初始化系统托盘"""
         self.tray = QSystemTrayIcon(self)
-        self.tray.setIcon(self.style().standardIcon(self.style().SP_ComputerIcon))
-        
+        self.tray.setIcon(self.generate_tray_icon())
+
         tray_menu = QMenu()
+        self.tray_start_action = tray_menu.addAction(self.tr('start_all'))
+        self.tray_start_action.triggered.connect(self.tray_start_all)
+        self.tray_stop_action = tray_menu.addAction(self.tr('stop_all'))
+        self.tray_stop_action.triggered.connect(self.tray_stop_all)
+        tray_menu.addSeparator()
         show_action = tray_menu.addAction(self.tr('show_window'))
-        show_action.triggered.connect(self.show)
+        show_action.triggered.connect(self.show_main_window)
         tray_menu.addSeparator()
         exit_action = tray_menu.addAction(self.tr('exit'))
         exit_action.triggered.connect(self.quit_app)
-        
+
         self.tray.setContextMenu(tray_menu)
         self.tray.activated.connect(self.on_tray_activated)
         self.tray.show()
-    
+        self.update_tray_actions()
+
+    def generate_tray_icon(self):
+        size = 64
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # 简约深色背景
+        painter.setBrush(QColor(20, 30, 50))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(2, 2, size - 4, size - 4, 12, 12)
+        
+        # 绘制连接线 - 从左侧到右侧的流动线条
+        center_y = size // 2
+        painter.setPen(QPen(QColor(0, 200, 255), 3))
+        
+        # 左侧起点（圆点）
+        painter.setBrush(QColor(0, 200, 255))
+        painter.drawEllipse(8, center_y - 3, 6, 6)
+        
+        # 右侧终点（圆点）
+        painter.drawEllipse(size - 14, center_y - 3, 6, 6)
+        
+        # 连接线 - 带有流动感的曲线
+        path = QPainterPath()
+        path.moveTo(14, center_y)
+        
+        # 创建平滑的S形曲线，象征数据流动
+        control1_x, control1_y = size // 3, center_y - 10
+        control2_x, control2_y = 2 * size // 3, center_y + 10
+        path.cubicTo(control1_x, control1_y, control2_x, control2_y, size - 20, center_y)
+        
+        painter.drawPath(path)
+        
+        # 在线条上添加几个小圆点表示数据传输
+        dot_positions = [
+            (size // 4, center_y - 5),
+            (size // 2, center_y),
+            (3 * size // 4, center_y + 5)
+        ]
+        
+        painter.setBrush(QColor(100, 255, 255))
+        for pos in dot_positions:
+            painter.drawEllipse(int(pos[0]) - 2, int(pos[1]) - 2, 4, 4)
+        
+        painter.end()
+        return QIcon(pixmap)
+    def tray_start_all(self):
+        if hasattr(self, 'auto_restart_checkbox') and self.auto_restart_checkbox is not None:
+            self.auto_restart_enabled = self.auto_restart_checkbox.isChecked()
+        self.start_all_tunnels()
+
+    def tray_stop_all(self):
+        self.stop_all_tunnels()
+
+    def update_tray_actions(self):
+        if not self.tray_start_action or not self.tray_stop_action:
+            return
+        has_tunnels = any(host.get('tunnels') for host in self.hosts)
+        running_exists = any(info.get('status') == 'running' for info in self.tunnels.values())
+        self.tray_start_action.setEnabled(has_tunnels)
+        self.tray_stop_action.setEnabled(running_exists)
+
+
+    def show_main_window(self):
+        self.show()
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+
     def on_tray_activated(self, reason):
         """托盘图标激活"""
         if reason == QSystemTrayIcon.DoubleClick:
-            self.show()
+            self.show_main_window()
     
     def change_language(self, index):
         """切换语言"""
@@ -849,12 +934,17 @@ class SSHTunnelManager(QMainWindow):
             tunnels = host.get('tunnels', [])
             for tunnel in tunnels:
                 tunnel_id = self.get_tunnel_id(host, tunnel)
+                info = self.tunnels.get(tunnel_id)
+                current_status = info.get('status', 'stopped') if info else 'stopped'
                 
                 # 主机名
                 self.tunnel_table.setItem(row, 0, QTableWidgetItem(host['name']))
                 
-                # 本地端口
-                self.tunnel_table.setItem(row, 1, QTableWidgetItem(str(tunnel['local_port'])))
+                # 本地端口按钮/标签
+                self.tunnel_table.setCellWidget(
+                    row, 1, self._build_local_port_widget(tunnel['local_port'], current_status)
+                )
+
                 
                 # 远程主机
                 self.tunnel_table.setItem(row, 2, QTableWidgetItem(tunnel.get('remote_host', '127.0.0.1')))
@@ -866,26 +956,23 @@ class SSHTunnelManager(QMainWindow):
                 status = self.tr('stopped')
                 color = QColor(200, 200, 200)
 
-                if tunnel_id in self.tunnels:
-                    info = self.tunnels[tunnel_id]
-                    current_status = info.get('status', 'stopped')
-                    if current_status == 'running':
-                        status = self.tr('running')
-                        color = QColor(144, 238, 144)
-                    elif current_status == 'starting':
-                        status = self.tr('starting')
-                        color = QColor(255, 255, 200)
-                    elif current_status == 'reconnecting':
-                        status = self.tr('reconnecting')
-                        color = QColor(255, 215, 0)
-                    elif current_status == 'error':
-                        status = self.tr('error')
-                        color = QColor(255, 160, 160)
-                    elif current_status == 'stopped':
-                        status = self.tr('stopped')
-                        color = QColor(200, 200, 200)
-                    else:
-                        status = current_status
+                if current_status == 'running':
+                    status = self.tr('running')
+                    color = QColor(144, 238, 144)
+                elif current_status == 'starting':
+                    status = self.tr('starting')
+                    color = QColor(255, 255, 200)
+                elif current_status == 'reconnecting':
+                    status = self.tr('reconnecting')
+                    color = QColor(255, 215, 0)
+                elif current_status == 'error':
+                    status = self.tr('error')
+                    color = QColor(255, 160, 160)
+                elif current_status == 'stopped':
+                    status = self.tr('stopped')
+                    color = QColor(200, 200, 200)
+                else:
+                    status = current_status
 
                 status_item = QTableWidgetItem(status)
                 status_item.setBackground(color)
@@ -896,7 +983,7 @@ class SSHTunnelManager(QMainWindow):
                 btn_layout = QHBoxLayout(btn_widget)
                 btn_layout.setContentsMargins(2, 2, 2, 2)
                 
-                if tunnel_id in self.tunnels and self.tunnels[tunnel_id]['status'] in ('running', 'starting', 'reconnecting'):
+                if current_status in ('running', 'starting', 'reconnecting'):
                     stop_btn = QPushButton(self.tr('stop'))
                     stop_btn.clicked.connect(lambda checked, h=host, t=tunnel: self.stop_single_tunnel(h, t))
                     btn_layout.addWidget(stop_btn)
@@ -910,7 +997,51 @@ class SSHTunnelManager(QMainWindow):
         
         # 重新启用更新
         self.tunnel_table.setUpdatesEnabled(True)
+        self.update_tray_actions()
     
+    def _build_local_port_widget(self, port, status):
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setAlignment(Qt.AlignCenter)
+
+        button = QPushButton(str(port))
+        button.setMinimumWidth(72)
+        button.setFixedHeight(26)
+        button.setCursor(Qt.PointingHandCursor if status == 'running' else Qt.ArrowCursor)
+        button.setEnabled(status == 'running')
+        button.setStyleSheet(
+            "QPushButton {"
+            " background-color: #e8f0ff;"
+            " color: #1d4ed8;"
+            " border: 1px solid #93c5fd;"
+            " border-radius: 6px;"
+            " padding: 2px 12px;"
+            "}"
+            "QPushButton:hover:enabled {"
+            " background-color: #dbeafe;"
+            " border-color: #60a5fa;"
+            "}"
+            "QPushButton:pressed:enabled {"
+            " background-color: #bfdbfe;"
+            " border-color: #3b82f6;"
+            "}"
+            "QPushButton:disabled {"
+            " background-color: #f3f4f6;"
+            " color: #9ca3af;"
+            " border: 1px dashed #d1d5db;"
+            "}"
+        )
+
+        if status == 'running':
+            button.setToolTip(f"{self.tr('open_local')}: http://127.0.0.1:{port}/")
+            button.clicked.connect(lambda checked, p=port: self.open_local_page(p))
+        else:
+            button.setToolTip(self.tr('open_local'))
+
+        layout.addWidget(button, alignment=Qt.AlignCenter)
+        return container
+
     def get_tunnel_id(self, host, tunnel):
         """生成隧道唯一ID"""
         return f"{host['name']}:{tunnel['local_port']}:{tunnel.get('remote_host', '127.0.0.1')}:{tunnel['remote_port']}"
@@ -1200,6 +1331,16 @@ class SSHTunnelManager(QMainWindow):
             info['status'] = 'stopped'
             info['allow_auto_restart'] = False
             self.refresh_tunnel_table()
+
+    def open_local_page(self, port):
+        """在默认浏览器中打开本地隧道地址"""
+        url = f'http://127.0.0.1:{port}/'
+        try:
+            opened = webbrowser.open(url)
+            if not opened:
+                QMessageBox.warning(self, self.tr('warning'), f'Cannot open {url}')
+        except Exception as exc:
+            QMessageBox.warning(self, self.tr('warning'), f'Cannot open {url}: {exc}')
 
     @pyqtSlot(str, str)
     def on_tunnel_status_changed(self, tunnel_id, status, error):
